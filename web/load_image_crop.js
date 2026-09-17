@@ -48,6 +48,8 @@ app.registerExtension({
             const node = this;
             const imageWidget = node.widgets.find((w) => w.name === "image");
             const cropWidget = node.widgets.find((w) => w.name === "crop");
+            const widthWidget = node.widgets.find((w) => w.name === "width");
+            const heightWidget = node.widgets.find((w) => w.name === "height");
 
             // The crop JSON widget is managed by the editor below.
             // widget.hidden hides it in the canvas renderer; options.hidden
@@ -134,6 +136,7 @@ app.registerExtension({
                     cropWidget.value = value;
                     dbg("crop synced:", value || "(cleared)");
                 }
+                syncDimensionWidgets();
             }
 
             function previewHeight(width) {
@@ -153,6 +156,96 @@ app.registerExtension({
                 return [pw, ph];
             }
 
+            function alignedImpliedRect(ratio) {
+                let r = impliedRect(ratio);
+                const useMp = !!node.widgets.find((w) => w.name === "use_megapixels")?.value;
+                const useMultiple = !!node.widgets.find((w) => w.name === "use_multiple")?.value;
+                if (!useMp && useMultiple) r = snapCropRect(r);
+                return r;
+            }
+
+            function currentSelectionDims() {
+                if (!state.img) return [0, 0];
+                if (state.rect) return cropDims(state.rect);
+                const ratio = aspectRatio();
+                const shown = ratio ? alignedImpliedRect(ratio) : null;
+                return shown ? cropDims(shown) : [state.img.width, state.img.height];
+            }
+            function dimensionsEditable() {
+                return true;
+            }
+            let syncingDimensionWidgets = false;
+            function syncDimensionWidgets() {
+                if (!widthWidget || !heightWidget || !state.img) return;
+                const [w,h]=currentSelectionDims();
+                syncingDimensionWidgets=true;
+                widthWidget.value=w; heightWidget.value=h;
+                // Keep the last crop-backed value separately. Some ComfyUI
+                // frontends make the small number arrows change INT widgets by
+                // 1 even when options.step is changed dynamically. The callback
+                // uses this baseline to turn that arrow click into one full
+                // selected-multiple step.
+                widthWidget.__obvpmSelectionValue = w;
+                heightWidget.__obvpmSelectionValue = h;
+                syncingDimensionWidgets=false;
+            }
+            function applyDimensionEdit(changedName) {
+                if (syncingDimensionWidgets || !state.img || !dimensionsEditable()) {
+                    syncDimensionWidgets(); return;
+                }
+                const iw=state.img.width, ih=state.img.height;
+                const useMp=!!node.widgets.find((w)=>w.name==="use_megapixels")?.value;
+                const useMultiple=!!node.widgets.find((w)=>w.name==="use_multiple")?.value;
+                const alignCropToMultiple=useMultiple && !useMp;
+                const multiple=Math.max(8,Number(node.widgets.find((w)=>w.name==="multiple")?.value)||8);
+                const ratio=aspectRatio();
+                const fit=(v,maxV)=>{
+                    v=Math.max(1,Math.min(maxV,Math.round(v)));
+                    if(!alignCropToMultiple)return v;
+                    const maxAligned=Math.max(multiple,Math.floor(maxV/multiple)*multiple);
+                    return Math.max(multiple,Math.min(maxAligned,Math.round(v/multiple)*multiple));
+                };
+                let rawW = Number(widthWidget.value) || 1;
+                let rawH = Number(heightWidget.value) || 1;
+
+                // The classic LiteGraph widget honors options.step, while some
+                // newer ComfyUI number controls still emit +/-1 from their small
+                // arrows after a dynamic step change. In Multiple-only mode,
+                // interpret any sub-multiple change from the last displayed crop
+                // value as one arrow step in that direction. Typed values are
+                // still rounded normally by fit().
+                if (alignCropToMultiple) {
+                    const changedWidget = changedName === "width" ? widthWidget : heightWidget;
+                    const baseline = Number(changedWidget.__obvpmSelectionValue);
+                    const raw = changedName === "width" ? rawW : rawH;
+                    const delta = raw - baseline;
+                    if (Number.isFinite(baseline) && delta !== 0 && Math.abs(delta) < multiple) {
+                        const stepped = baseline + Math.sign(delta) * multiple;
+                        if (changedName === "width") rawW = stepped;
+                        else rawH = stepped;
+                    }
+                }
+
+                let w=fit(rawW,iw);
+                let h=fit(rawH,ih);
+                if(ratio){
+                    if(changedName==="width"){
+                        h=fit(w/ratio,ih);
+                        if(w/ratio>ih){h=fit(ih,ih);w=fit(h*ratio,iw);}
+                    }else{
+                        w=fit(h*ratio,iw);
+                        if(h*ratio>iw){w=fit(iw,iw);h=fit(w/ratio,ih);}
+                    }
+                }
+                const old=state.rect;
+                const x=old?old.x:Math.max(0,(1-w/iw)/2);
+                const y=old?old.y:Math.max(0,(1-h/ih)/2);
+                state.rect={x:Math.max(0,Math.min(1-w/iw,x)),
+                            y:Math.max(0,Math.min(1-h/ih,y)),w:w/iw,h:h/ih};
+                syncCrop(); syncDimensionWidgets();
+                editorWidget.triggerDraw?.(); node.setDirtyCanvas(true,true);
+            }
+
             // Mirror the backend's Resolution Selector-style output sizing.
             function fixedAspectParts() {
                 const value = String(node.widgets.find((x) => x.name === "aspect")?.value ?? "");
@@ -162,28 +255,6 @@ app.registerExtension({
                 return a > 0 && b > 0 ? [a, b] : null;
             }
 
-            function gcd(a, b) {
-                while (b) [a, b] = [b, a % b];
-                return a;
-            }
-
-            // Smallest exact fixed-aspect integer-pixel size. If `multiple`
-            // is supplied, both dimensions are also multiples of it.
-            function aspectBase(multiple = 1) {
-                const parts = fixedAspectParts();
-                if (!parts) return null;
-                const [a, b] = parts;
-                const g = gcd(a, b);
-                const ar = a / g, br = b / g;
-                // Need k*ar and k*br both divisible by multiple.
-                const gcd2 = (x, y) => { while (y) [x, y] = [y, x % y]; return x; };
-                const lcm = (x, y) => x / gcd2(x, y) * y;
-                const kStep = lcm(
-                    multiple / gcd2(ar, multiple),
-                    multiple / gcd2(br, multiple)
-                );
-                return [ar * kStep, br * kStep];
-            }
 
             function outputDims(w, h) {
                 const useMp = !!node.widgets.find((x) => x.name === "use_megapixels")?.value;
@@ -224,10 +295,14 @@ app.registerExtension({
                     Number(node.widgets.find((x) => x.name === "multiple")?.value) || 8));
                 const iw = state.img.width, ih = state.img.height;
 
-                const pw = Math.max(multiple,
-                    Math.min(iw, Math.round((rect.w * iw) / multiple) * multiple));
-                const ph = Math.max(multiple,
-                    Math.min(ih, Math.round((rect.h * ih) / multiple) * multiple));
+                const alignWithin = (value, maxValue) => {
+                    if (maxValue < multiple) return maxValue;
+                    let aligned = Math.round(value / multiple) * multiple;
+                    if (aligned > maxValue) aligned = Math.floor(maxValue / multiple) * multiple;
+                    return Math.max(multiple, aligned);
+                };
+                const pw = alignWithin(rect.w * iw, iw);
+                const ph = alignWithin(rect.h * ih, ih);
 
                 // Keep the candidate's top-left position. Unlike the old
                 // center-based snap this does not make resize handles jump.
@@ -358,7 +433,7 @@ app.registerExtension({
 
                     const ratioDraw = aspectRatio();
                     const shown = state.rect
-                        || (ratioDraw ? impliedRect(ratioDraw) : null);
+                        || (ratioDraw ? alignedImpliedRect(ratioDraw) : null);
                     if (shown && !lowQuality) {
                         const sx = bx + shown.x * bw;
                         const sy = by + shown.y * bh;
@@ -441,7 +516,7 @@ app.registerExtension({
                         ];
                         if (!state.rect) {
                             const ratio = aspectRatio();
-                            const shown = ratio ? impliedRect(ratio) : null;
+                            const shown = ratio ? alignedImpliedRect(ratio) : null;
                             const source = shown ? cropDims(shown) : [iw, ih];
                             const output = outputDims(source[0], source[1]);
                             const isUpscaling = output[0] > source[0] || output[1] > source[1];
@@ -492,7 +567,7 @@ app.registerExtension({
                         // same move/resize paths apply.
                         const ratioDown = aspectRatio();
                         if (!state.rect && ratioDown) {
-                            state.rect = impliedRect(ratioDown);
+                            state.rect = alignedImpliedRect(ratioDown);
                         }
                         state.drag = { ...hitTest(px, py), startX: px, startY: py, moved: false };
                         const el = event.target;
@@ -573,6 +648,7 @@ app.registerExtension({
                                 }
                             }
                         }
+                        syncDimensionWidgets();
                         this.triggerDraw?.();
                         return true;
                     }
@@ -700,13 +776,25 @@ app.registerExtension({
                     if (widget.__obvpmType !== undefined) {
                         widget.type = widget.__obvpmType;
                         widget.computeSize = widget.__obvpmComputeSize;
+                        widget.hidden = widget.__obvpmHidden;
+                        widget.options = widget.options || {};
+                        widget.options.hidden = widget.__obvpmOptionsHidden;
                         delete widget.__obvpmType;
                         delete widget.__obvpmComputeSize;
+                        delete widget.__obvpmHidden;
+                        delete widget.__obvpmOptionsHidden;
                     }
                 } else if (widget.__obvpmType === undefined) {
                     widget.__obvpmType = widget.type;
                     widget.__obvpmComputeSize = widget.computeSize;
+                    widget.__obvpmHidden = !!widget.hidden;
+                    widget.options = widget.options || {};
+                    widget.__obvpmOptionsHidden = !!widget.options.hidden;
                     widget.type = "hidden";
+                    widget.hidden = true;
+                    widget.options.hidden = true;
+                    // LiteGraph adds a 4px inter-widget gap. -4 cancels that
+                    // gap so the hidden row consumes exactly zero layout space.
                     widget.computeSize = () => [0, -4];
                 }
             }
@@ -718,6 +806,19 @@ app.registerExtension({
                 const multiple = node.widgets.find((w) => w.name === "multiple");
                 setWidgetVisible(mp, !!useMp?.value);
                 setWidgetVisible(multiple, !!useMultiple?.value);
+// Width/height use the native numeric arrows. In Multiple-only
+                // mode one click changes exactly one selected multiple; otherwise
+                // it changes one pixel. The normal widget callback then updates
+                // the crop and, for fixed aspects, derives the other dimension.
+                const dimStep = (!useMp?.value && useMultiple?.value)
+                    ? Math.max(8, Math.round(Number(multiple?.value) || 8))
+                    : 1;
+                for (const dimWidget of [widthWidget, heightWidget]) {
+                    if (!dimWidget) continue;
+                    dimWidget.options ??= {};
+                    dimWidget.options.step = dimStep;
+                    dimWidget.options.disabled = false;
+                }
                 editorWidget.triggerDraw?.();
                 node.setDirtyCanvas(true, true);
             }
@@ -729,10 +830,27 @@ app.registerExtension({
                 toggle.callback = function () {
                     const r = previous?.apply(this, arguments);
                     updateOptionalWidgets();
+                    if (toggleName === "use_multiple" && toggle.value &&
+                        !node.widgets.find((w) => w.name === "use_megapixels")?.value && state.img) {
+                        if (!state.rect) {
+                            const ratio = aspectRatio();
+                            state.rect = ratio
+                                ? alignedImpliedRect(ratio)
+                                : { x: 0, y: 0, w: 1, h: 1 };
+                        }
+                        state.rect = snapCropRect(state.rect);
+                        syncCrop();
+                    }
+                    syncDimensionWidgets();
                     return r;
                 };
             }
             updateOptionalWidgets();
+            for(const [name,widget] of [["width",widthWidget],["height",heightWidget]]){
+                if(!widget)continue;
+                const previous=widget.callback;
+                widget.callback=function(){const r=previous?.apply(this,arguments);applyDimensionEdit(name);return r;};
+            }
 
             for (const widgetName of ["megapixels", "multiple"]) {
                 const widget = node.widgets.find((w) => w.name === widgetName);
@@ -740,9 +858,13 @@ app.registerExtension({
                 const prevCallback = widget.callback;
                 widget.callback = function () {
                     const r = prevCallback?.apply(this, arguments);
-                    if (widgetName === "multiple" && state.rect) {
-                        state.rect = snapCropRect(state.rect);
-                        cropWidget.value = JSON.stringify(state.rect);
+                    if (widgetName === "multiple") {
+                        if (state.rect) {
+                            state.rect = snapCropRect(state.rect);
+                            syncCrop();
+                        }
+                        updateOptionalWidgets();
+                        syncDimensionWidgets();
                     }
                     editorWidget.triggerDraw?.();
                     node.setDirtyCanvas(true, true);
@@ -768,6 +890,9 @@ app.registerExtension({
                         state.rect = snapCropRect(state.rect);
                         syncCrop();
                     }
+                    // Even without an explicit crop, changing aspect changes the
+                    // dashed implied selection. Width/height must reflect it now.
+                    syncDimensionWidgets();
                     editorWidget.triggerDraw?.();
                     node.setDirtyCanvas(true, true);
                     return r;
@@ -798,6 +923,7 @@ app.registerExtension({
                 img.onload = () => {
                     if (seq !== loadSeq) return; // superseded by a newer load
                     state.img = img;
+                    syncDimensionWidgets();
                     dbg("image loaded:", info.filename, img.width + "x" + img.height);
                     if (autoFit && !isVueMode()) {
                         // Fit the node height to the image aspect once, when
@@ -845,6 +971,8 @@ app.registerExtension({
                     state.rect = null;
                 }
                 dbg("configured; crop:", cropWidget.value || "(none)", "image:", imageWidget.value);
+                updateOptionalWidgets();
+                syncDimensionWidgets();
                 loadImage();
                 return r;
             };

@@ -113,16 +113,30 @@ def _aspect_value(aspect):
 
 
 
-def _target_dimensions(megapixels, ratio, multiple, aspect_pair=None):
+
+def _round_positive(value):
+    """Match JavaScript Math.round for non-negative pixel values."""
+    return math.floor(value + 0.5)
+
+def _align_within(value, maximum, multiple):
+    """Nearest positive multiple, but never beyond the source dimension."""
+    if maximum < multiple:
+        return maximum
+    aligned = _round_positive(value / multiple) * multiple
+    if aligned > maximum:
+        aligned = math.floor(maximum / multiple) * multiple
+    return max(multiple, aligned)
+
+def _target_dimensions(megapixels, ratio, multiple):
     """Resolution Selector-style target: ideal aspect/MP, then round W/H independently."""
     total_pixels = megapixels * 1024 * 1024
     ideal_height = math.sqrt(total_pixels / ratio)
     ideal_width = ideal_height * ratio
-    width = round(ideal_width / multiple) * multiple
-    height = round(ideal_height / multiple) * multiple
+    width = _round_positive(ideal_width / multiple) * multiple
+    height = _round_positive(ideal_height / multiple) * multiple
     return max(multiple, width), max(multiple, height)
 
-def _centered_box(width, height, ratio):
+def _centered_box(width, height, ratio, multiple=None):
     """The largest centered (x0, y0, x1, y1) of pixel ratio `ratio`.
 
     What an empty crop MEANS under a fixed aspect: the full image is not
@@ -135,6 +149,10 @@ def _centered_box(width, height, ratio):
     if h > height:
         h = height
         w = round(h * ratio)
+    if multiple:
+        # In Multiple-only mode the crop itself is multiple-aligned.
+        w = _align_within(w, width, multiple)
+        h = _align_within(h, height, multiple)
     x0 = (width - w) // 2
     y0 = (height - h) // 2
     return (x0, y0, x0 + max(1, w), y0 + max(1, h))
@@ -195,17 +213,21 @@ class LoadImageCrop:
                 }),
                 "use_multiple": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Enable multiple-aligned crop sizes and output dimensions.",
+                    "tooltip": "Align crop dimensions to the selected multiple when megapixel sizing is off; when megapixel sizing is on, align only the output dimensions.",
                 }),
                 "multiple": ("INT", {
-                    "default": 8, "min": 1, "max": 1024, "step": 1,
-                    "tooltip": "Crop/output width and height are constrained to this pixel multiple.",
+                    "default": 8, "min": 8, "max": 1024, "step": 4,
+                    "tooltip": "Pixel multiple: 8, 12, 16, 20, 24, ...",
                 }),
+                "width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 1,
+                    "tooltip": "Current crop width in pixels. Always editable."}),
+                "height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 1,
+                    "tooltip": "Current crop height in pixels. Always editable."}),
             }
         }
 
     def load(self, image, crop="", aspect="Free", use_megapixels=True,
-             megapixels=1.0, use_multiple=True, multiple=8):
+             megapixels=1.0, use_multiple=True, multiple=8, width=0, height=0):
         megapixels = finite_number(megapixels, "megapixels", 0.01, 128)
         multiple = int(finite_number(multiple, "multiple", 1, 1024))
         _aspect_value(aspect)
@@ -247,7 +269,9 @@ class LoadImageCrop:
         ratio = _aspect_value(aspect)
         if ratio is not None:
             if box is None:
-                box = _centered_box(images.shape[2], images.shape[1], ratio)
+                box = _centered_box(
+                    images.shape[2], images.shape[1], ratio,
+                    multiple if (use_multiple and not use_megapixels) else None)
                 if box == (0, 0, images.shape[2], images.shape[1]):
                     box = None          # already exactly that shape
             else:
@@ -256,12 +280,24 @@ class LoadImageCrop:
                 # rather than silently reshaping a selection. Tolerance
                 # covers the normalized->pixel rounding, nothing more.
                 bw, bh = box[2] - box[0], box[3] - box[1]
-                if abs(bw - ratio * bh) > 2.0 * (1.0 + ratio):
+                # With Multiple enabled, W/H are rounded independently to the
+                # selected multiple (Resolution Selector semantics), so the
+                # stored integer crop may be slightly off the nominal ratio.
+                if not use_multiple and abs(bw - ratio * bh) > 2.0 * (1.0 + ratio):
                     raise ValueError(
                         "Load Image & Crop: the stored crop is %dx%d, "
                         "which is not %s. Redraw the crop with the "
                         "aspect set, or switch aspect back to 'Free'."
                         % (bw, bh, aspect))
+        if box is None and ratio is None and use_multiple and not use_megapixels:
+            src_w, src_h = images.shape[2], images.shape[1]
+            crop_w = _align_within(src_w, src_w, multiple)
+            crop_h = _align_within(src_h, src_h, multiple)
+            if crop_w != src_w or crop_h != src_h:
+                x0 = (src_w - crop_w) // 2
+                y0 = (src_h - crop_h) // 2
+                box = (x0, y0, x0 + crop_w, y0 + crop_h)
+
         if box is not None:
             x0, y0, x1, y1 = box
             images = images[:, y0:y1, x0:x1, :]
@@ -272,12 +308,10 @@ class LoadImageCrop:
 
         if use_megapixels:
             target_pixels = megapixels * 1024 * 1024
-            current_pixels = width * height
             ratio_for_resize = _aspect_value(aspect) or (width / height)
             if use_multiple:
-                pair = ASPECT_RATIOS.get(aspect)
                 new_width, new_height = _target_dimensions(
-                    megapixels, ratio_for_resize, multiple, pair)
+                    megapixels, ratio_for_resize, multiple)
             else:
                 # No multiple: use the ideal selected/crop ratio and round
                 # width/height independently to whole pixels, matching the UI.
@@ -289,8 +323,8 @@ class LoadImageCrop:
             # Normally the frontend already stores a multiple-aligned crop.
             # This fallback also handles old/hand-edited/wired crop JSON.
             if width % multiple or height % multiple:
-                new_width = max(multiple, round(width / multiple) * multiple)
-                new_height = max(multiple, round(height / multiple) * multiple)
+                new_width = max(multiple, _round_positive(width / multiple) * multiple)
+                new_height = max(multiple, _round_positive(height / multiple) * multiple)
 
         if new_width != width or new_height != height:
             import comfy.utils
@@ -305,13 +339,13 @@ class LoadImageCrop:
 
     @classmethod
     def IS_CHANGED(cls, image, crop="", aspect="Free", use_megapixels=True,
-                   megapixels=1.0, use_multiple=True, multiple=8):
+                   megapixels=1.0, use_multiple=True, multiple=8, width=0, height=0):
         return hash_images([image])
 
     @classmethod
     def VALIDATE_INPUTS(cls, image, crop="", aspect="Free",
                         use_megapixels=True, megapixels=1.0,
-                        use_multiple=True, multiple=8):
+                        use_multiple=True, multiple=8, width=0, height=0):
         try:
             image_path(image)
             finite_number(megapixels, "megapixels", 0.01, 128)
