@@ -3,6 +3,7 @@ on:
   push:
     tags:
       - "v*"
+      - "!v*-jitb.*"
   workflow_dispatch:
     inputs:
       tag:
