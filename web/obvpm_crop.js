@@ -16,11 +16,10 @@ export const ASPECT_CHOICES = ["free", "21:9", "2:1", "16:9", "3:2",
                                "4:3", "5:4", "1:1", "4:5", "3:4", "2:3",
                                "9:16", "1:2"];
 
-/** "a:b" -> a/b as a number; null for free/absent/unparseable. */
+/** Read a leading "a:b" from either a bare ratio or a named preset. */
 export function parseAspect(value) {
-    const parts = String(value ?? "").split(":");
-    const r = parts.length === 2
-        ? Number(parts[0]) / Number(parts[1]) : NaN;
+    const match = String(value ?? "").match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)/);
+    const r = match ? Number(match[1]) / Number(match[2]) : NaN;
     return Number.isFinite(r) && r > 0 ? r : null;
 }
 

@@ -143,31 +143,99 @@ app.registerExtension({
             }
 
             function cropDims(r = state.rect) {
-                // Mirror the backend's _parse_crop rounding.
+                // Width/height must depend only on the rectangle size, not its
+                // position. Rounding both endpoints independently can make the
+                // displayed size oscillate by 1 px while moving the crop.
                 const iw = state.img.width;
                 const ih = state.img.height;
-                const x0 = Math.max(0, Math.min(iw - 1, Math.round(r.x * iw)));
-                const y0 = Math.max(0, Math.min(ih - 1, Math.round(r.y * ih)));
-                const x1 = Math.max(x0 + 1, Math.min(iw, Math.round((r.x + r.w) * iw)));
-                const y1 = Math.max(y0 + 1, Math.min(ih, Math.round((r.y + r.h) * ih)));
-                return [x1 - x0, y1 - y0];
+                const pw = Math.max(1, Math.min(iw, Math.round(r.w * iw)));
+                const ph = Math.max(1, Math.min(ih, Math.round(r.h * ih)));
+                return [pw, ph];
             }
 
-            // Returns [w, h] after the max_megapixels cap, or null if it
-            // doesn't shrink this size.
-            function cappedDims(w, h) {
-                const mpWidget = node.widgets.find((x) => x.name === "max_megapixels");
-                const mp = mpWidget ? Number(mpWidget.value) || 0 : 0;
-                if (mp <= 0) return null;
+            // Mirror the backend's Resolution Selector-style output sizing.
+            function fixedAspectParts() {
+                const value = String(node.widgets.find((x) => x.name === "aspect")?.value ?? "");
+                const m = value.match(/^(\d+):(\d+)/);
+                if (!m) return null;
+                const a = Number(m[1]), b = Number(m[2]);
+                return a > 0 && b > 0 ? [a, b] : null;
+            }
+
+            function gcd(a, b) {
+                while (b) [a, b] = [b, a % b];
+                return a;
+            }
+
+            // Smallest exact fixed-aspect integer-pixel size. If `multiple`
+            // is supplied, both dimensions are also multiples of it.
+            function aspectBase(multiple = 1) {
+                const parts = fixedAspectParts();
+                if (!parts) return null;
+                const [a, b] = parts;
+                const g = gcd(a, b);
+                const ar = a / g, br = b / g;
+                // Need k*ar and k*br both divisible by multiple.
+                const gcd2 = (x, y) => { while (y) [x, y] = [y, x % y]; return x; };
+                const lcm = (x, y) => x / gcd2(x, y) * y;
+                const kStep = lcm(
+                    multiple / gcd2(ar, multiple),
+                    multiple / gcd2(br, multiple)
+                );
+                return [ar * kStep, br * kStep];
+            }
+
+            function outputDims(w, h) {
+                const useMp = !!node.widgets.find((x) => x.name === "use_megapixels")?.value;
+                const useMultiple = !!node.widgets.find((x) => x.name === "use_multiple")?.value;
+                const mp = Number(node.widgets.find((x) => x.name === "megapixels")?.value) || 1.0;
+                const multiple = Math.max(1, Math.round(
+                    Number(node.widgets.find((x) => x.name === "multiple")?.value) || 8));
+
+                if (!useMp) {
+                    if (!useMultiple) return [w, h];
+                    return [
+                        Math.max(multiple, Math.round(w / multiple) * multiple),
+                        Math.max(multiple, Math.round(h / multiple) * multiple),
+                    ];
+                }
+
                 const target = mp * 1024 * 1024;
-                if (w * h <= target) return null;
-                const s = Math.sqrt(target / (w * h));
-                return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
+                const parts = fixedAspectParts();
+                const ratio = parts ? (parts[0] / parts[1]) : (w / h);
+                const idealH = Math.sqrt(target / ratio);
+                const idealW = idealH * ratio;
+
+                if (useMultiple) {
+                    return [
+                        Math.max(multiple, Math.round(idealW / multiple) * multiple),
+                        Math.max(multiple, Math.round(idealH / multiple) * multiple),
+                    ];
+                }
+                return [Math.max(1, Math.round(idealW)), Math.max(1, Math.round(idealH))];
             }
 
-            // The pinned aspect as a PIXEL ratio, or null for free.
-            // The preview box is aspect-correct, so the same number
-            // constrains screen-space drags directly.
+            function snapCropRect(rect) {
+                const useMp = !!node.widgets.find((x) => x.name === "use_megapixels")?.value;
+                const useMultiple = !!node.widgets.find((x) => x.name === "use_multiple")?.value;
+                if (useMp || !useMultiple || !state.img?.width || !state.img?.height) return rect;
+
+                const multiple = Math.max(1, Math.round(
+                    Number(node.widgets.find((x) => x.name === "multiple")?.value) || 8));
+                const iw = state.img.width, ih = state.img.height;
+
+                const pw = Math.max(multiple,
+                    Math.min(iw, Math.round((rect.w * iw) / multiple) * multiple));
+                const ph = Math.max(multiple,
+                    Math.min(ih, Math.round((rect.h * ih) / multiple) * multiple));
+
+                // Keep the candidate's top-left position. Unlike the old
+                // center-based snap this does not make resize handles jump.
+                const x = Math.max(0, Math.min(1 - pw / iw, rect.x));
+                const y = Math.max(0, Math.min(1 - ph / ih, rect.y));
+                return { x, y, w: pw / iw, h: ph / ih };
+            }
+
             function aspectRatio() {
                 const w = node.widgets.find((x) => x.name === "aspect");
                 return parseAspect(w?.value);
@@ -344,19 +412,18 @@ app.registerExtension({
                             [[`${pw} x ${ph}`, "#fff"]],
                             sy > y + pillH + 2 ? sy - 3 : sy + pillH - 1
                         );
-                        const capped = cappedDims(pw, ph);
-                        if (capped) {
-                            // Downscale result below the selection.
-                            const belowY = sy + sh + pillH - 1;
-                            const ty = belowY < y + imgAreaH - 2 ? belowY : sy + sh - 4;
-                            drawPill(
-                                [
-                                    ["Downscaled To: ", "#aaa"],
-                                    [`${capped[0]} x ${capped[1]}`, "#fff"],
-                                ],
-                                ty
-                            );
-                        }
+                        const output = outputDims(pw, ph);
+                        const belowY = sy + sh + pillH - 1;
+                        const ty = belowY < y + imgAreaH - 2 ? belowY : sy + sh - 4;
+                        const isUpscaling = output[0] > pw || output[1] > ph;
+                        drawPill(
+                            [
+                                ["Output: ", "#aaa"],
+                                [`${output[0]} x ${output[1]}`, "#fff"],
+                                ...(isUpscaling ? [["   UPSCALING", "#ffcc66"]] : []),
+                            ],
+                            ty
+                        );
                     }
 
                     if (!lowQuality) {
@@ -373,13 +440,16 @@ app.registerExtension({
                             [`${iw} x ${ih}`, false],
                         ];
                         if (!state.rect) {
-                            const capped = cappedDims(iw, ih);
-                            if (capped) {
-                                segments.push(
-                                    ["   Downscaled To: ", true],
-                                    [`${capped[0]} x ${capped[1]}`, false]
-                                );
-                            }
+                            const ratio = aspectRatio();
+                            const shown = ratio ? impliedRect(ratio) : null;
+                            const source = shown ? cropDims(shown) : [iw, ih];
+                            const output = outputDims(source[0], source[1]);
+                            const isUpscaling = output[0] > source[0] || output[1] > source[1];
+                            segments.push(
+                                ["   Output: ", true],
+                                [`${output[0]} x ${output[1]}`, false],
+                                ...(isUpscaling ? [["   UPSCALING", true]] : [])
+                            );
                         }
                         ctx.font = `${u.font}px sans-serif`;
                         ctx.textBaseline = "alphabetic";
@@ -453,19 +523,19 @@ app.registerExtension({
                                 const locked = ratioRect(
                                     drag.startX, drag.startY,
                                     clampX(px), clampY(py), ratio);
-                                if (locked) state.rect = locked;
+                                if (locked) state.rect = snapCropRect(locked);
                             } else {
                                 const x0 = clampX(Math.min(drag.startX, px));
                                 const y0 = clampY(Math.min(drag.startY, py));
                                 const x1 = clampX(Math.max(drag.startX, px));
                                 const y1 = clampY(Math.max(drag.startY, py));
                                 if (x1 - x0 >= MIN_SEL && y1 - y0 >= MIN_SEL) {
-                                    state.rect = {
+                                    state.rect = snapCropRect({
                                         x: (x0 - bx) / bw,
                                         y: (y0 - by) / bh,
                                         w: (x1 - x0) / bw,
                                         h: (y1 - y0) / bh,
-                                    };
+                                    });
                                 }
                             }
                         } else if (drag.mode === "move" && state.rect) {
@@ -487,19 +557,19 @@ app.registerExtension({
                                 const ay = drag.corner.includes("n") ? y1 : y0;
                                 const locked = ratioRect(
                                     ax, ay, clampX(px), clampY(py), ratio);
-                                if (locked) state.rect = locked;
+                                if (locked) state.rect = snapCropRect(locked);
                             } else {
                                 if (drag.corner.includes("w")) x0 = clampX(px);
                                 if (drag.corner.includes("e")) x1 = clampX(px);
                                 if (drag.corner.includes("n")) y0 = clampY(py);
                                 if (drag.corner.includes("s")) y1 = clampY(py);
                                 if (Math.abs(x1 - x0) >= MIN_SEL && Math.abs(y1 - y0) >= MIN_SEL) {
-                                    state.rect = {
+                                    state.rect = snapCropRect({
                                         x: (Math.min(x0, x1) - bx) / bw,
                                         y: (Math.min(y0, y1) - by) / bh,
                                         w: Math.abs(x1 - x0) / bw,
                                         h: Math.abs(y1 - y0) / bh,
-                                    };
+                                    });
                                 }
                             }
                         }
@@ -624,11 +694,56 @@ app.registerExtension({
                 setTimeout(wipe, 150);
             }
 
-            const mpWidget = node.widgets.find((w) => w.name === "max_megapixels");
-            if (mpWidget) {
-                const prevMpCallback = mpWidget.callback;
-                mpWidget.callback = function () {
-                    const r = prevMpCallback?.apply(this, arguments);
+            function setWidgetVisible(widget, visible) {
+                if (!widget) return;
+                if (visible) {
+                    if (widget.__obvpmType !== undefined) {
+                        widget.type = widget.__obvpmType;
+                        widget.computeSize = widget.__obvpmComputeSize;
+                        delete widget.__obvpmType;
+                        delete widget.__obvpmComputeSize;
+                    }
+                } else if (widget.__obvpmType === undefined) {
+                    widget.__obvpmType = widget.type;
+                    widget.__obvpmComputeSize = widget.computeSize;
+                    widget.type = "hidden";
+                    widget.computeSize = () => [0, -4];
+                }
+            }
+
+            function updateOptionalWidgets() {
+                const useMp = node.widgets.find((w) => w.name === "use_megapixels");
+                const mp = node.widgets.find((w) => w.name === "megapixels");
+                const useMultiple = node.widgets.find((w) => w.name === "use_multiple");
+                const multiple = node.widgets.find((w) => w.name === "multiple");
+                setWidgetVisible(mp, !!useMp?.value);
+                setWidgetVisible(multiple, !!useMultiple?.value);
+                editorWidget.triggerDraw?.();
+                node.setDirtyCanvas(true, true);
+            }
+
+            for (const toggleName of ["use_megapixels", "use_multiple"]) {
+                const toggle = node.widgets.find((w) => w.name === toggleName);
+                if (!toggle) continue;
+                const previous = toggle.callback;
+                toggle.callback = function () {
+                    const r = previous?.apply(this, arguments);
+                    updateOptionalWidgets();
+                    return r;
+                };
+            }
+            updateOptionalWidgets();
+
+            for (const widgetName of ["megapixels", "multiple"]) {
+                const widget = node.widgets.find((w) => w.name === widgetName);
+                if (!widget) continue;
+                const prevCallback = widget.callback;
+                widget.callback = function () {
+                    const r = prevCallback?.apply(this, arguments);
+                    if (widgetName === "multiple" && state.rect) {
+                        state.rect = snapCropRect(state.rect);
+                        cropWidget.value = JSON.stringify(state.rect);
+                    }
                     editorWidget.triggerDraw?.();
                     node.setDirtyCanvas(true, true);
                     return r;
@@ -650,6 +765,7 @@ app.registerExtension({
                         state.rect = snapRectToAspect(
                             state.rect, state.img.width, state.img.height,
                             ratio);
+                        state.rect = snapCropRect(state.rect);
                         syncCrop();
                     }
                     editorWidget.triggerDraw?.();

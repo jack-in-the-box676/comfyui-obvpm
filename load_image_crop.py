@@ -69,34 +69,58 @@ def _parse_crop(crop, width, height):
         return None
     if not all(math.isfinite(v) and 0 <= v <= 1 for v in (x, y, w, h)):
         raise ValueError("Crop coordinates must be finite normalized numbers between 0 and 1")
-    x0 = max(0, min(width - 1, round(x * width)))
-    y0 = max(0, min(height - 1, round(y * height)))
-    x1 = max(x0 + 1, min(width, round((x + w) * width)))
-    y1 = max(y0 + 1, min(height, round((y + h) * height)))
+    # Round size independently from position. This keeps the actual crop
+    # dimensions stable when the same rectangle is moved across the image.
+    crop_w = max(1, min(width, round(w * width)))
+    crop_h = max(1, min(height, round(h * height)))
+    x0 = max(0, min(width - crop_w, round(x * width)))
+    y0 = max(0, min(height - crop_h, round(y * height)))
+    x1 = x0 + crop_w
+    y1 = y0 + crop_h
     if x0 == 0 and y0 == 0 and x1 == width and y1 == height:
         return None
     return (x0, y0, x1, y1)
 
 
-# Offered shapes, widest to tallest. "free" is the unconstrained editor
-# this node always had; the others pin the crop rectangle's pixel ratio.
-ASPECTS = ("free", "21:9", "2:1", "16:9", "3:2", "4:3", "5:4", "1:1",
-           "4:5", "3:4", "2:3", "9:16", "1:2")
+# Named presets. Core Resolution Selector labels are retained where
+# applicable; OBVPM's additional ratios are named consistently.
+ASPECT_RATIOS = {
+    "Free": None,
+    "1:1 (Square)": (1, 1),
+    "2:3 (Portrait Photo)": (2, 3),
+    "3:2 (Photo)": (3, 2),
+    "3:4 (Portrait Standard)": (3, 4),
+    "4:3 (Standard)": (4, 3),
+    "9:16 (Portrait Widescreen)": (9, 16),
+    "16:9 (Widescreen)": (16, 9),
+    "21:9 (Ultrawide)": (21, 9),
+    "1:2 (Portrait 2:1)": (1, 2),
+    "2:1 (Wide 2:1)": (2, 1),
+    "4:5 (Portrait 5:4)": (4, 5),
+    "5:4 (Landscape 5:4)": (5, 4),
+}
+ASPECTS = tuple(ASPECT_RATIOS)
 
 
 def _aspect_value(aspect):
-    """'a:b' -> finite positive a/b; None for free/absent."""
-    try:
-        a, b = str(aspect or "").split(":")
-        ratio = float(a) / float(b)
-        if not math.isfinite(ratio) or not 1 / 16384 <= ratio <= 16384:
-            raise ValueError("Aspect ratio must be finite, positive and within 1:16384..16384:1")
-        return ratio
-    except (ValueError, ZeroDivisionError):
-        if aspect not in (None, "", "free"):
-            raise ValueError("Invalid aspect ratio: %r" % aspect) from None
+    """Named preset -> finite positive width/height; None for Free."""
+    if aspect in (None, "", "free", "Free"):
         return None
+    pair = ASPECT_RATIOS.get(aspect)
+    if pair is None:
+        raise ValueError("Invalid aspect ratio: %r" % aspect)
+    return pair[0] / pair[1]
 
+
+
+def _target_dimensions(megapixels, ratio, multiple, aspect_pair=None):
+    """Resolution Selector-style target: ideal aspect/MP, then round W/H independently."""
+    total_pixels = megapixels * 1024 * 1024
+    ideal_height = math.sqrt(total_pixels / ratio)
+    ideal_width = ideal_height * ratio
+    width = round(ideal_width / multiple) * multiple
+    height = round(ideal_height / multiple) * multiple
+    return max(multiple, width), max(multiple, height)
 
 def _centered_box(width, height, ratio):
     """The largest centered (x0, y0, x1, y1) of pixel ratio `ratio`.
@@ -119,19 +143,21 @@ def _centered_box(width, height, ratio):
 class LoadImageCrop:
     CATEGORY = "obvpm/image"
     FUNCTION = "load"
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("image", "mask")
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT")
+    RETURN_NAMES = ("image", "mask", "width", "height")
     DESCRIPTION = (
         "Loads an image and crops it to the area selected interactively on "
         "the node's preview. Drag to draw the crop area, drag inside it to "
         "move, drag its corners to resize, click to clear. With no crop "
-        "drawn the full image is output. If max_megapixels is greater than "
-        "0, the output is scaled down to fit within it (aspect preserved)."
+        "drawn the full image is output. The selected area is resized using "
+        "Resolution Selector-style megapixel and multiple controls."
     )
 
     OUTPUT_TOOLTIPS = (
-        "The loaded image, cropped to the selection (if any) and scaled down to max_megapixels (if set).",
-        "Mask from the image's alpha channel, cropped and scaled the same way.",
+        "The loaded image, cropped to the selection and resized to the requested resolution.",
+        "Mask from the image's alpha channel, cropped and resized the same way.",
+        "Final output width in pixels.",
+        "Final output height in pixels.",
     )
 
     @classmethod
@@ -148,26 +174,40 @@ class LoadImageCrop:
                     "default": "",
                     "tooltip": "Managed by the crop editor on the node — no need to edit by hand.",
                 }),
-                "max_megapixels": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 128.0, "step": 0.01,
-                    "tooltip": "If the selected image area is larger than this many megapixels, then it is downscaled to it for output. Set to 0 to disable downscaling.",
-                }),
                 "aspect": (list(ASPECTS), {
-                    "default": "free",
+                    "default": "Free",
                     "tooltip": "Pin the crop rectangle to a fixed aspect "
                                "ratio: drawing and resizing keep the "
                                "shape, and with no crop drawn the output "
                                "is the largest centered cut of that "
-                               "ratio. 'free' is the unconstrained "
+                               "ratio. 'Free' is the unconstrained "
                                "editor. A stored crop that disagrees "
                                "with the ratio refuses at run time "
                                "rather than being silently reshaped.",
                 }),
+                "use_megapixels": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable target megapixel resizing.",
+                }),
+                "megapixels": ("FLOAT", {
+                    "default": 1.0, "min": 0.01, "max": 128.0, "step": 0.01,
+                    "tooltip": "Target output size in megapixels (1 MP = 1024 x 1024 pixels).",
+                }),
+                "use_multiple": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable multiple-aligned crop sizes and output dimensions.",
+                }),
+                "multiple": ("INT", {
+                    "default": 8, "min": 1, "max": 1024, "step": 1,
+                    "tooltip": "Crop/output width and height are constrained to this pixel multiple.",
+                }),
             }
         }
 
-    def load(self, image, crop="", max_megapixels=0.0, aspect="free"):
-        max_megapixels = finite_number(max_megapixels, "max_megapixels", 0, 128)
+    def load(self, image, crop="", aspect="Free", use_megapixels=True,
+             megapixels=1.0, use_multiple=True, multiple=8):
+        megapixels = finite_number(megapixels, "megapixels", 0.01, 128)
+        multiple = int(finite_number(multiple, "multiple", 1, 1024))
         _aspect_value(aspect)
         _parse_crop(crop, 1, 1)
         paths, counts = inspect_images([image], animation=True)
@@ -188,14 +228,21 @@ class LoadImageCrop:
                     mask = 1.0 - torch.from_numpy(np.array(i.getchannel("A")).astype(np.float32) / 255.0)
                 else:
                     mask = torch.zeros((i.height, i.width), dtype=torch.float32)
-                # Crop/downscale each frame before retaining the batch.
-                images, masks = self._crop_frame(frame, mask.unsqueeze(0), crop, max_megapixels, aspect)
+                # Crop/resize each frame before retaining the batch.
+                images, masks = self._crop_frame(
+                    frame, mask.unsqueeze(0), crop, aspect, use_megapixels,
+                    megapixels, use_multiple, multiple)
                 output_images.append(images)
                 output_masks.append(masks)
-        return (torch.cat(output_images, dim=0), torch.cat(output_masks, dim=0))
+
+        result_images = torch.cat(output_images, dim=0)
+        result_masks = torch.cat(output_masks, dim=0)
+        return (result_images, result_masks,
+                result_images.shape[2], result_images.shape[1])
 
     @staticmethod
-    def _crop_frame(images, masks, crop, max_megapixels, aspect):
+    def _crop_frame(images, masks, crop, aspect, use_megapixels,
+                    megapixels, use_multiple, multiple):
         box = _parse_crop(crop, images.shape[2], images.shape[1])
         ratio = _aspect_value(aspect)
         if ratio is not None:
@@ -213,42 +260,62 @@ class LoadImageCrop:
                     raise ValueError(
                         "Load Image & Crop: the stored crop is %dx%d, "
                         "which is not %s. Redraw the crop with the "
-                        "aspect set, or switch aspect back to 'free'."
+                        "aspect set, or switch aspect back to 'Free'."
                         % (bw, bh, aspect))
         if box is not None:
             x0, y0, x1, y1 = box
             images = images[:, y0:y1, x0:x1, :]
             masks = masks[:, y0:y1, x0:x1]
 
-        if max_megapixels > 0:
-            import comfy.utils
+        height, width = images.shape[1], images.shape[2]
+        new_width, new_height = width, height
 
-            height, width = images.shape[1], images.shape[2]
-            target = max_megapixels * 1024 * 1024
-            current = width * height
-            if current > target:
-                scale = (target / current) ** 0.5
-                new_width = max(1, round(width * scale))
-                new_height = max(1, round(height * scale))
-                images = comfy.utils.common_upscale(
-                    images.movedim(-1, 1), new_width, new_height, "lanczos", "disabled"
-                ).movedim(1, -1)
-                masks = comfy.utils.common_upscale(
-                    masks.unsqueeze(1), new_width, new_height, "bilinear", "disabled"
-                ).squeeze(1)
+        if use_megapixels:
+            target_pixels = megapixels * 1024 * 1024
+            current_pixels = width * height
+            ratio_for_resize = _aspect_value(aspect) or (width / height)
+            if use_multiple:
+                pair = ASPECT_RATIOS.get(aspect)
+                new_width, new_height = _target_dimensions(
+                    megapixels, ratio_for_resize, multiple, pair)
+            else:
+                # No multiple: use the ideal selected/crop ratio and round
+                # width/height independently to whole pixels, matching the UI.
+                ideal_height = math.sqrt(target_pixels / ratio_for_resize)
+                ideal_width = ideal_height * ratio_for_resize
+                new_width = max(1, round(ideal_width))
+                new_height = max(1, round(ideal_height))
+        elif use_multiple:
+            # Normally the frontend already stores a multiple-aligned crop.
+            # This fallback also handles old/hand-edited/wired crop JSON.
+            if width % multiple or height % multiple:
+                new_width = max(multiple, round(width / multiple) * multiple)
+                new_height = max(multiple, round(height / multiple) * multiple)
+
+        if new_width != width or new_height != height:
+            import comfy.utils
+            images = comfy.utils.common_upscale(
+                images.movedim(-1, 1), new_width, new_height, "lanczos", "disabled"
+            ).movedim(1, -1)
+            masks = comfy.utils.common_upscale(
+                masks.unsqueeze(1), new_width, new_height, "bilinear", "disabled"
+            ).squeeze(1)
 
         return (images, masks)
 
     @classmethod
-    def IS_CHANGED(cls, image, crop="", max_megapixels=0.0, aspect="free"):
+    def IS_CHANGED(cls, image, crop="", aspect="Free", use_megapixels=True,
+                   megapixels=1.0, use_multiple=True, multiple=8):
         return hash_images([image])
 
     @classmethod
-    def VALIDATE_INPUTS(cls, image, crop="", max_megapixels=0.0,
-                        aspect="free"):
+    def VALIDATE_INPUTS(cls, image, crop="", aspect="Free",
+                        use_megapixels=True, megapixels=1.0,
+                        use_multiple=True, multiple=8):
         try:
             image_path(image)
-            finite_number(max_megapixels, "max_megapixels", 0, 128)
+            finite_number(megapixels, "megapixels", 0.01, 128)
+            int(finite_number(multiple, "multiple", 1, 1024))
             _aspect_value(aspect)
             _parse_crop(crop, 1, 1)
         except (ValueError, OSError) as exc:
